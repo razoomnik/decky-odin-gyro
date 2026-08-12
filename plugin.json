@@ -1,0 +1,10 @@
+{
+  "name": "Odin Gyro",
+  "author": "Kirill Spitsyn",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["ayn", "odin3", "gyro", "armada"],
+    "description": "Install/update and calibrate the AYN Odin 3 gyro fix on Armada."
+  }
+}
