@@ -1,6 +1,6 @@
 {
   "name": "odin-gyro-decky",
-  "version": "0.1.0",
+  "version": "0.1.14",
   "description": "Decky plugin for AYN Odin 3 gyro recovery and calibration on Armada",
   "type": "module",
   "scripts": {

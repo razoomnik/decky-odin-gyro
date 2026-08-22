@@ -4,8 +4,8 @@
 #
 # What it does:
 #   1. Detects the exact Armada kernel image and matching armada-packages commit.
-#   2. Rebuilds sns_iio.ko for the currently running kernel.
-#   3. Builds adsprpcd + snsfeed and installs the Qualcomm sensor registry.
+#   2. Rebuilds sns_iio.ko from the exact kernel source pinned by the current Armada deployment.
+#   3. Uses the built module vermagic as the exact installation target, then builds userspace.
 #   4. Installs and enables odin3-sensors.service.
 #   5. Adds the bmi323-imu source to the Odin 3 InputPlumber profile.
 #   6. Fixes automatic screen rotation with ACCEL_MOUNT_MATRIX.
@@ -21,10 +21,17 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.14"
 WORK_ROOT="${ODIN3_GYRO_WORKDIR:-$HOME/odin3-gyro-recovery}"
 FORCE_REBUILD=0
 MODE="install"
+normalize_kernel_version() {
+    local value=$1
+    # Linux release candidates may be represented as either 7.2-rc7 in the
+    # source metadata or 7.2.0-rc7 by the built kernel. Treat those forms as
+    # equivalent while leaving normal stable versions unchanged.
+    printf '%s\n' "$value" | sed -E 's/^([0-9]+\.[0-9]+)\.0-(rc[0-9]+)(.*)$/\1-\2\3/'
+}
 
 ARMADA_REPO="https://github.com/virtudude/armada.git"
 ARMADA_PACKAGES_REPO="https://github.com/virtudude/armada-packages.git"
@@ -47,6 +54,7 @@ RESOLVED_COMMIT_PREFIX=""
 RESOLVED_FULL_COMMIT=""
 RESOLVED_SENSOR_TREE=""
 BUILT_MODULE_FILE=""
+BUILT_MODULE_KERNEL=""
 BUILT_USERSPACE_DIR=""
 
 usage() {
@@ -287,9 +295,8 @@ resolve_current_kernel_source() {
     armada_commit="${armada_version##*.}"
     containerfile="$WORK_ROOT/Armada-Containerfile-${armada_commit}"
 
-    log "Resolving the exact source of the running Armada kernel"
+    log "Resolving the exact kernel source for the current Armada deployment"
     note "Armada version: $armada_version"
-    note "Running kernel: $(uname -r)"
 
     download \
         "https://raw.githubusercontent.com/virtudude/armada/${armada_commit}/Containerfile" \
@@ -314,7 +321,7 @@ resolve_current_kernel_source() {
             "$kernel_registry" \
             "$kernel_digest" \
             "$tags_json"
-    )" || die "No GHCR tag points to the running kernel digest: $kernel_digest"
+    )" || die "No GHCR tag points to the current Armada kernel digest: $kernel_digest"
 
     packages_short_commit="${kernel_tag##*-}"
     [[ "$packages_short_commit" =~ ^[0-9a-fA-F]{7,40}$ ]] ||
@@ -380,12 +387,14 @@ build_kernel_module() {
     local sensor_tree=$2
     local builder_image=$3
     local kernel_dir="$repo_dir/kernel"
-    local build_cache="$WORK_ROOT/kernel-work"
-    local output_dir="$WORK_ROOT/output/$(uname -r)"
+    local commit_cache_key="${RESOLVED_FULL_COMMIT:0:12}"
+    local build_cache="$WORK_ROOT/kernel-work-${commit_cache_key}"
+    local output_dir
     local patch_source
     local module_source_dir="$WORK_ROOT/sns-iio-external"
     local inside_script="$WORK_ROOT/build-kernel-module-inside-container.sh"
     local expected_base_version
+    local host_vmlinuz runtime_vmlinuz runtime_stock_module host_release_file host_resolver
 
     patch_source="$sensor_tree/projects/ROCKNIX/devices/SM8750/patches/linux/$SNS_PATCH_NAME"
     [[ -f "$patch_source" ]] ||
@@ -399,17 +408,144 @@ build_kernel_module() {
     [[ -n "$expected_base_version" ]] ||
         die "Kernel VERSION is missing from armada-packages BASE.env."
 
-    [[ "$(uname -r)" == "$expected_base_version"* ]] ||
-        die "Source kernel $expected_base_version does not match running kernel $(uname -r)."
+    local normalized_source cached_vermagic cached_kernel
+    normalized_source="$(normalize_kernel_version "$expected_base_version")"
 
+    # Decky may execute the backend through an emulation/runtime environment
+    # whose /usr view is not the host Armada root. Ask PID 1/systemd to run a
+    # short native helper. The helper resolves the installed module tree using
+    # Armada's .armada-source marker and copies the exact vmlinuz plus one
+    # stock module into the shared /var work directory.
+    runtime_vmlinuz="$WORK_ROOT/installed-vmlinuz-${commit_cache_key}"
+    runtime_stock_module="$WORK_ROOT/installed-stock-module-${commit_cache_key}.ko"
+    host_release_file="$WORK_ROOT/installed-module-release-${commit_cache_key}.txt"
+    host_resolver="$WORK_ROOT/resolve-host-kernel-${commit_cache_key}.sh"
+
+    cat >"$host_resolver" <<'HOST_RESOLVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+expected="$1"
+dest_vmlinuz="$2"
+dest_stock="$3"
+dest_release="$4"
+
+module_dir=""
+for marker in /usr/lib/modules/*/.armada-source; do
+    [[ -f "$marker" ]] || continue
+    source_line="$(sed -n 's/^Source:[[:space:]]*//p' "$marker" | head -n 1)"
+    source_name="${source_line%% *}"
+    if [[ "$source_name" == "linux-${expected}" ]]; then
+        module_dir="${marker%/.armada-source}"
+        break
+    fi
+done
+
+if [[ -z "$module_dir" ]]; then
+    echo "ERROR: native host could not find an Armada module tree for linux-${expected}." >&2
+    echo "Available Armada source markers:" >&2
+    for marker in /usr/lib/modules/*/.armada-source; do
+        [[ -f "$marker" ]] || continue
+        printf '  %s: ' "$marker" >&2
+        head -n 1 "$marker" >&2 || true
+    done
+    exit 1
+fi
+
+[[ -f "$module_dir/vmlinuz" ]] || {
+    echo "ERROR: native host vmlinuz is missing: $module_dir/vmlinuz" >&2
+    exit 1
+}
+
+stock="$(find "$module_dir/kernel" -type f \
+    \( -name '*.ko' -o -name '*.ko.zst' -o -name '*.ko.xz' \) \
+    -print -quit 2>/dev/null || true)"
+[[ -n "$stock" ]] || {
+    echo "ERROR: no stock kernel module was found under $module_dir/kernel" >&2
+    exit 1
+}
+
+install -Dm644 "$module_dir/vmlinuz" "$dest_vmlinuz"
+mkdir -p "$(dirname "$dest_stock")"
+case "$stock" in
+    *.ko)
+        cp -f "$stock" "$dest_stock"
+        ;;
+    *.ko.zst)
+        command -v zstd >/dev/null 2>&1 || {
+            echo "ERROR: zstd is required to inspect the stock module." >&2
+            exit 1
+        }
+        zstd -dc "$stock" >"$dest_stock"
+        ;;
+    *.ko.xz)
+        command -v xz >/dev/null 2>&1 || {
+            echo "ERROR: xz is required to inspect the stock module." >&2
+            exit 1
+        }
+        xz -dc "$stock" >"$dest_stock"
+        ;;
+esac
+chmod 0644 "$dest_stock"
+printf '%s\n' "${module_dir##*/}" >"$dest_release"
+
+echo "Installed Armada module tree: $module_dir"
+echo "Installed Armada source: linux-${expected}"
+echo "Stock module used for ABI check: $stock"
+HOST_RESOLVER
+    chmod +x "$host_resolver"
+
+    rm -f "$runtime_vmlinuz" "$runtime_stock_module" "$host_release_file"
+
+    log "Resolving the installed Armada kernel through native systemd"
+    sudo systemd-run \
+        --quiet \
+        --wait \
+        --collect \
+        --pipe \
+        /usr/bin/bash "$host_resolver" \
+        "$expected_base_version" \
+        "$runtime_vmlinuz" \
+        "$runtime_stock_module" \
+        "$host_release_file"
+
+    [[ -s "$runtime_vmlinuz" ]] ||
+        die "Native host resolver did not copy the installed Armada vmlinuz."
+    [[ -s "$runtime_stock_module" ]] ||
+        die "Native host resolver did not copy a stock Armada module."
+    [[ -s "$host_release_file" ]] ||
+        die "Native host resolver did not report the installed module release."
+
+    local host_module_release
+    host_module_release="$(head -n 1 "$host_release_file" | tr -d '\r\n')"
+    [[ -n "$host_module_release" ]] ||
+        die "Installed Armada module release is empty."
+
+    note "Installed Armada module release: $host_module_release"
+    note "Installed Armada kernel image copied from native host."
+
+    # Do not inspect the kernel release reported by the Decky backend. The
+    # recovery target is defined by the exact kernel pinned by the current
+    # Armada deployment. The module's own vermagic becomes the install target.
+    [[ -n "$RESOLVED_FULL_COMMIT" ]] || die "Exact armada-packages commit was not resolved before kernel build."
+    output_dir="$WORK_ROOT/output/kernel-${expected_base_version}-${commit_cache_key}-installed-config-v2"
     mkdir -p "$output_dir"
 
-    if [[ $FORCE_REBUILD -eq 0 &&
-          -f "$output_dir/sns_iio.ko" &&
-          "$(modinfo -F vermagic "$output_dir/sns_iio.ko" 2>/dev/null || true)" == "$(uname -r)"\ * ]]; then
-        note "Using cached module: $output_dir/sns_iio.ko"
-        BUILT_MODULE_FILE="$output_dir/sns_iio.ko"
-        return
+    note "Armada kernel source: $expected_base_version"
+    note "Installed Armada kernel image: native host copy ($runtime_vmlinuz)"
+    note "Kernel build cache key: armada-packages ${RESOLVED_FULL_COMMIT} + installed kernel config"
+
+    if [[ $FORCE_REBUILD -eq 0 && -f "$output_dir/sns_iio.ko" ]]; then
+        cached_vermagic="$(modinfo -F vermagic "$output_dir/sns_iio.ko" 2>/dev/null || true)"
+        cached_kernel="${cached_vermagic%% *}"
+        if [[ -n "$cached_kernel" &&
+              "$(normalize_kernel_version "$cached_kernel")" == "$normalized_source"* ]]; then
+            note "Using cached module for exact armada-packages commit: $output_dir/sns_iio.ko"
+            note "Module vermagic target: $cached_kernel"
+            BUILT_MODULE_FILE="$output_dir/sns_iio.ko"
+            BUILT_MODULE_KERNEL="$cached_kernel"
+            return
+        fi
     fi
 
     log "Preparing sns_iio as an external kernel module"
@@ -508,7 +644,7 @@ set -Eeuo pipefail
 
 dnf -y install \
     gcc binutils make bc bison flex openssl-devel \
-    elfutils-libelf-devel zstd xz cpio patch curl \
+    elfutils-libelf-devel dwarves zstd xz cpio patch curl \
     perl-interpreter python3 findutils diffutils \
     gawk grep sed coreutils hostname gzip tar ccache file
 
@@ -564,12 +700,46 @@ PY_PATCH_CONFIG_GUARD
 
 cat >>/tmp/prepare-armada-kernel.sh <<'MODULE_BUILD'
 
-echo "==> Preparing external sns_iio module"
+echo "==> Loading exact config from installed Armada vmlinuz"
 
-if grep -q '^CONFIG_MODULE_SIG_FORCE=y' .config; then
-    echo "ERROR: the running-style kernel configuration enforces module signatures." >&2
+[[ -r /host-vmlinuz ]] || {
+    echo "ERROR: installed Armada vmlinuz was not mounted into the builder." >&2
+    exit 1
+}
+
+bash scripts/extract-ikconfig /host-vmlinuz > /tmp/armada-installed.config
+config_lines="$(wc -l < /tmp/armada-installed.config)"
+if (( config_lines < 1000 )); then
+    echo "ERROR: could not extract a complete kernel config from installed Armada vmlinuz." >&2
     exit 1
 fi
+
+echo "Installed kernel config lines: $config_lines"
+cp /tmp/armada-installed.config .config
+
+# Re-resolve generated Kconfig metadata with the exact Armada builder image.
+# The builder must preserve every option that changes struct module layout.
+make "${MAKE_ARGS[@]}" olddefconfig
+
+for symbol in DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DYNAMIC_DEBUG_CORE; do
+    if grep -q "^CONFIG_${symbol}=y" /tmp/armada-installed.config && \
+       ! grep -q "^CONFIG_${symbol}=y" .config; then
+        echo "ERROR: exact Armada CONFIG_${symbol}=y did not survive olddefconfig." >&2
+        exit 1
+    fi
+done
+
+if grep -qE '^CONFIG_RANDSTRUCT_(FULL|PERFORMANCE)=y|^CONFIG_RANDSTRUCT=y' .config; then
+    echo "ERROR: this Armada kernel uses RANDSTRUCT; the original build seed is required for external modules." >&2
+    exit 1
+fi
+
+if grep -q '^CONFIG_MODULE_SIG_FORCE=y' .config; then
+    echo "ERROR: the installed Armada kernel configuration enforces module signatures." >&2
+    exit 1
+fi
+
+echo "Exact config: DEBUG_INFO_BTF_MODULES=$(grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' .config && echo y || echo n), DYNAMIC_DEBUG_CORE=$(grep -q '^CONFIG_DYNAMIC_DEBUG_CORE=y' .config && echo y || echo n)"
 
 # The external module needs a prepared tree. With CONFIG_MODVERSIONS, a real
 # Module.symvers is also required, so build the in-tree modules once.
@@ -580,7 +750,7 @@ else
     make "${MAKE_ARGS[@]}" modules_prepare
 fi
 
-echo "==> Building sns_iio out-of-tree"
+echo "==> Building sns_iio out-of-tree using installed Armada config"
 make "${MAKE_ARGS[@]}" \
     KBUILD_MODPOST_WARN=1 \
     M=/sns-module \
@@ -593,6 +763,7 @@ install -Dm644 \
     "${OUT_DIR}/sns_iio.ko"
 
 cp .config "${OUT_DIR}/sns_iio.config"
+cp /tmp/armada-installed.config "${OUT_DIR}/armada-installed.config"
 sha256sum "${OUT_DIR}/sns_iio.ko" \
     >"${OUT_DIR}/sns_iio.ko.sha256"
 
@@ -610,7 +781,7 @@ CONTAINER
 
     chmod +x "$inside_script"
 
-    log "Building external sns_iio.ko for kernel $(uname -r)"
+    log "Building external sns_iio.ko for Armada kernel source $expected_base_version"
 
     sudo podman run --rm \
         --pull=never \
@@ -621,6 +792,7 @@ CONTAINER
         -v "$output_dir:/output:Z" \
         -v "$module_source_dir:/sns-module:Z" \
         -v "$inside_script:/build-module.sh:ro,Z" \
+        -v "$runtime_vmlinuz:/host-vmlinuz:ro,Z" \
         -w /work \
         "$builder_image" \
         /build-module.sh
@@ -630,13 +802,69 @@ CONTAINER
     [[ -f "$output_dir/sns_iio.ko" ]] ||
         die "sns_iio.ko was not produced."
 
-    local module_vermagic
+    local module_vermagic module_kernel normalized_module
     module_vermagic="$(modinfo -F vermagic "$output_dir/sns_iio.ko")"
-    [[ "$module_vermagic" == "$(uname -r)"\ * ]] ||
-        die "Built module vermagic does not match the running kernel: $module_vermagic"
+    module_kernel="${module_vermagic%% *}"
+    normalized_module="$(normalize_kernel_version "$module_kernel")"
+
+    [[ -n "$module_kernel" && "$normalized_module" == "$normalized_source"* ]] ||
+        die "Built module vermagic does not match Armada kernel source $expected_base_version: $module_vermagic"
+
+    # Compare the struct module payload emitted into the external module with a
+    # native module shipped by this exact Armada kernel. This catches config
+    # mismatches before insmod can fail with Invalid module format.
+    local stock_module section_report
+    stock_module="$runtime_stock_module"
+    if [[ -s "$stock_module" ]]; then
+        section_report="$(python3 - "$output_dir/sns_iio.ko" "$stock_module" <<'PY_ELF_SECTION'
+import struct
+import sys
+
+def section_size(path, wanted):
+    data = open(path, 'rb').read()
+    if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
+        raise SystemExit(f'Unsupported ELF file: {path}')
+    shoff = struct.unpack_from('<Q', data, 0x28)[0]
+    shentsize = struct.unpack_from('<H', data, 0x3A)[0]
+    shnum = struct.unpack_from('<H', data, 0x3C)[0]
+    shstrndx = struct.unpack_from('<H', data, 0x3E)[0]
+    strhdr = shoff + shstrndx * shentsize
+    stroff = struct.unpack_from('<Q', data, strhdr + 0x18)[0]
+    strsize = struct.unpack_from('<Q', data, strhdr + 0x20)[0]
+    strings = data[stroff:stroff + strsize]
+    for i in range(shnum):
+        off = shoff + i * shentsize
+        nameoff = struct.unpack_from('<I', data, off)[0]
+        end = strings.find(b'\0', nameoff)
+        if end < 0:
+            continue
+        name = strings[nameoff:end].decode(errors='replace')
+        if name == wanted:
+            return struct.unpack_from('<Q', data, off + 0x20)[0]
+    return None
+
+wanted = '.gnu.linkonce.this_module'
+built = section_size(sys.argv[1], wanted)
+stock = section_size(sys.argv[2], wanted)
+print(f'{built}:{stock}')
+PY_ELF_SECTION
+)"
+        local built_section_size stock_section_size
+        built_section_size="${section_report%%:*}"
+        stock_section_size="${section_report##*:}"
+        note "struct module section: built=${built_section_size} bytes, Armada=${stock_section_size} bytes"
+        [[ -n "$built_section_size" && "$built_section_size" != "None" && \
+           "$built_section_size" == "$stock_section_size" ]] ||
+            die "Built module struct layout still differs from the installed Armada kernel."
+    else
+        warn "No uncompressed stock .ko was found for struct-module size verification."
+    fi
 
     note "Built module: $output_dir/sns_iio.ko"
+    note "Module vermagic target: $module_kernel"
+    note "Install target: $MODULE_ROOT/$module_kernel/sns_iio.ko"
     BUILT_MODULE_FILE="$output_dir/sns_iio.ko"
+    BUILT_MODULE_KERNEL="$module_kernel"
 }
 
 build_userspace() {
@@ -805,7 +1033,14 @@ install_runtime() {
     local inputplumber_source
     local backup_dir
 
-    kernel_version="$(uname -r)"
+    kernel_version="${BUILT_MODULE_KERNEL:-}"
+    if [[ -z "$kernel_version" ]]; then
+        kernel_version="$(modinfo -F vermagic "$module_file" 2>/dev/null | awk '{print $1}')"
+    fi
+    [[ -n "$kernel_version" ]] ||
+        die "Could not determine install target from module vermagic."
+
+    note "Installing sns_iio for module release: $kernel_version"
     inputplumber_source="$(find_inputplumber_profile)"
     backup_dir="$WORK_ROOT/backups/$(date +%Y%m%d-%H%M%S)"
 
@@ -859,7 +1094,7 @@ set -Eeuo pipefail
 
 BASE="/var/lib/odin3-gyro"
 EXEC="${BASE}/bin"
-KVER="$(uname -r)"
+KVER="$(cat /proc/sys/kernel/osrelease)"
 MODULE="${BASE}/modules/${KVER}/sns_iio.ko"
 REGISTRY="${BASE}/qcom-hexagon-fs"
 HEXFS="/run/odin3-gyro/qcom-hexagon-fs"
@@ -1025,7 +1260,20 @@ RULE
     sudo systemctl enable odin3-sensors.service
     sudo udevadm control --reload-rules
 
-    sudo systemctl restart odin3-sensors.service
+    if ! sudo systemctl restart odin3-sensors.service; then
+        echo
+        echo "===== odin3-sensors.service ====="
+        sudo systemctl status odin3-sensors.service --no-pager -l || true
+        echo
+        echo "===== odin3-sensors journal ====="
+        sudo journalctl -u odin3-sensors.service -b --no-pager -n 80 || true
+        echo
+        echo "===== kernel module rejection ====="
+        sudo journalctl -k -b --no-pager -n 120 | \
+            grep -Ei 'sns_iio|module|vermagic|symbol|signature|invalid|linkonce|struct module' | \
+            tail -60 || true
+        die "odin3-sensors.service failed to start."
+    fi
     sleep 12
 
     sudo systemctl restart inputplumber.service
